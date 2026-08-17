@@ -1,182 +1,158 @@
-from flask import Flask, request, jsonify, render_template_string
-import requests
+import html
 import os
+import re
+from functools import lru_cache
 
-app = Flask(__name__)
+import gradio as gr
+import numpy as np
+import torch
+from lime.lime_text import LimeTextExplainer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
-API_URL = "https://api-inference.huggingface.co/models/kinterious-69/fake-news-distilbert"
+HF_MODEL_ID = "kinterious-69/fake-news-distilbert"
+LABEL_NAMES = ["Real", "Fake"]
+MAX_LENGTH = 128
+LIME_SAMPLES = 60
+LIME_FEATURES = 10
+PREDICTION_BATCH_SIZE = 16
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cpu":
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
 
-FAKE_WORDS = ["secret","secretly","banned","ban","permanently","shocking",
-              "explosive","hoax","conspiracy","hidden","exposed","miracle",
-              "cure","cures","guaranteed","confirmed","proves","undeniable"]
+_model = None
+_tokenizer = None
+_explainer = None
 
-REAL_WORDS = ["according","reported","announced","said","study","research",
-              "scientists","researchers","experts","university","published",
-              "percent","data","evidence","signed","approved","official"]
 
-HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fake News Detector</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Arial,sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{background:#fff;border-radius:16px;padding:2rem;max-width:680px;width:100%;box-shadow:0 4px 24px rgba(0,0,0,0.1)}
-h1{color:#1F4E79;text-align:center;font-size:1.8rem;margin-bottom:4px}
-.sub{color:#888;text-align:center;font-size:.85rem;margin-bottom:1.5rem}
-textarea{width:100%;padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:1rem;resize:vertical;min-height:90px;outline:none;font-family:Arial}
-textarea:focus{border-color:#2E75B6}
-.btn{width:100%;padding:12px;background:#1F4E79;color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:bold;cursor:pointer;margin-top:10px;transition:.2s}
-.btn:hover{background:#2E75B6}
-.samples{margin-top:10px}
-.samples p{font-size:.8rem;color:#888;margin-bottom:6px}
-.sbtn{background:#f0f2f5;border:1px solid #ddd;border-radius:6px;padding:5px 10px;font-size:.78rem;cursor:pointer;margin:2px;display:inline-block}
-.sbtn:hover{background:#ddd}
-.result{margin-top:1.2rem;display:none}
-.fake-box{background:#fdedec;border-left:5px solid #c0392b;padding:1rem;border-radius:8px;margin-bottom:10px}
-.real-box{background:#eafaf1;border-left:5px solid #27ae60;padding:1rem;border-radius:8px;margin-bottom:10px}
-.vlabel{font-size:1.3rem;font-weight:bold}
-.fake-lbl{color:#c0392b}.real-lbl{color:#1e8449}
-.vscore{color:#555;font-size:.9rem;margin-top:4px}
-.bars{margin-top:8px}
-.bar-row{display:flex;align-items:center;gap:8px;margin:4px 0}
-.bar-label{font-size:.8rem;width:30px;color:#555}
-.bar-bg{flex:1;background:#e0e0e0;border-radius:8px;height:10px;overflow:hidden}
-.bar-fill-r{background:#27ae60;height:100%;border-radius:8px;transition:.5s}
-.bar-fill-f{background:#c0392b;height:100%;border-radius:8px;transition:.5s}
-.section{background:#f8f9fa;border-radius:8px;padding:1rem;margin-bottom:10px}
-.section h3{color:#1F4E79;font-size:.95rem;margin-bottom:6px}
-.highlights{line-height:2.2;font-size:.95rem}
-.fw{background:rgba(192,57,43,.2);border-radius:3px;padding:1px 4px}
-.rw{background:rgba(39,174,96,.2);border-radius:3px;padding:1px 4px}
-.legend{font-size:.75rem;color:#888;margin-top:6px}
-.loading{text-align:center;color:#888;padding:1rem;display:none}
-.disclaimer{font-size:.72rem;color:#aaa;text-align:center;margin-top:1rem;border-top:1px solid #eee;padding-top:10px}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>🕵️ Fake News Detector</h1>
-  <p class="sub">Powered by DistilBERT · AI Final Group Project</p>
-  <textarea id="txt" placeholder='Enter a news claim e.g. "The government secretly banned all elections permanently."'></textarea>
-  <div class="samples">
-    <p>💡 Try a sample:</p>
-    <span class="sbtn" onclick="set('The government secretly banned all elections and free speech permanently.')">Fake sample 1</span>
-    <span class="sbtn" onclick="set('Scientists confirm drinking bleach cures all known diseases.')">Fake sample 2</span>
-    <span class="sbtn" onclick="set('NASA announced plans to return astronauts to the moon by 2026.')">Real sample 1</span>
-    <span class="sbtn" onclick="set('The president signed a new infrastructure bill worth 1 trillion dollars.')">Real sample 2</span>
-  </div>
-  <button class="btn" onclick="analyze()">🔍 Analyze Claim</button>
-  <div class="loading" id="loading">⏳ Analyzing... please wait</div>
-  <div class="result" id="result">
-    <div id="vbox">
-      <div class="vlabel" id="vlbl"></div>
-      <div class="vscore" id="vscore"></div>
-      <div class="bars">
-        <div class="bar-row"><span class="bar-label">Real</span><div class="bar-bg"><div class="bar-fill-r" id="rbar"></div></div></div>
-        <div class="bar-row"><span class="bar-label">Fake</span><div class="bar-bg"><div class="bar-fill-f" id="fbar"></div></div></div>
-      </div>
-    </div>
-    <div class="section" style="margin-top:10px">
-      <h3>🔍 Word-Level Explanation</h3>
-      <div class="highlights" id="hl"></div>
-      <div class="legend">🔴 Red = pushes toward FAKE &nbsp; 🟢 Green = pushes toward REAL</div>
-    </div>
-    <div class="section">
-      <h3>📊 Key Indicators</h3>
-      <div id="exp" style="font-size:.9rem;color:#444"></div>
-    </div>
-  </div>
-  <p class="disclaimer">⚠️ Decision-support tool only. Always verify with trusted sources.</p>
-</div>
-<script>
-function set(t){document.getElementById('txt').value=t}
-async function analyze(){
-  const text=document.getElementById('txt').value.trim();
-  if(!text){alert('Please enter a claim.');return}
-  document.getElementById('loading').style.display='block';
-  document.getElementById('result').style.display='none';
-  const r=await fetch('/predict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-  const d=await r.json();
-  document.getElementById('loading').style.display='none';
-  document.getElementById('result').style.display='block';
-  const vbox=document.getElementById('vbox');
-  const vlbl=document.getElementById('vlbl');
-  if(d.label==='Fake'){
-    vbox.className='fake-box';
-    vlbl.innerHTML='<span class="fake-lbl">⚠️ LIKELY FAKE</span>';
-  }else{
-    vbox.className='real-box';
-    vlbl.innerHTML='<span class="real-lbl">✅ LIKELY REAL</span>';
-  }
-  document.getElementById('vscore').textContent='Confidence: '+d.confidence+'% | Real: '+d.prob_real+'% | Fake: '+d.prob_fake+'%';
-  document.getElementById('rbar').style.width=d.prob_real+'%';
-  document.getElementById('fbar').style.width=d.prob_fake+'%';
-  document.getElementById('hl').innerHTML=d.highlights;
-  document.getElementById('exp').textContent=d.explanation;
-}
-</script>
-</body>
-</html>"""
+def load_model():
+    global _model, _tokenizer, _explainer
+    if _model is None:
+        print(f"Loading {HF_MODEL_ID} on {DEVICE}...")
+        _tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
+        _model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_ID)
+        _model.to(DEVICE)
+        _model.eval()
+        _explainer = LimeTextExplainer(class_names=LABEL_NAMES, random_state=42)
+        print("Model loaded successfully.")
+    return _tokenizer, _model, _explainer
 
-@app.route("/")
-def index():
-    return render_template_string(HTML)
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    text = request.json.get("text", "").strip()
-    if not text:
-        return jsonify({"error": "No text"})
+def predict_proba(texts):
+    """Batched inference; LIME perturbations are processed in batches."""
+    tokenizer, model, _ = load_model()
+    clean_texts = [str(t)[:4000] for t in texts]
+    results = []
+    for start in range(0, len(clean_texts), PREDICTION_BATCH_SIZE):
+        batch = clean_texts[start:start + PREDICTION_BATCH_SIZE]
+        inputs = tokenizer(
+            batch, return_tensors="pt", truncation=True,
+            max_length=MAX_LENGTH, padding=True
+        )
+        inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+        with torch.inference_mode():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)
+        results.append(probs.detach().cpu().numpy())
+    return np.vstack(results)
+
+
+@lru_cache(maxsize=32)
+def cached_prediction(text):
+    return tuple(float(x) for x in predict_proba([text])[0])
+
+
+def normalize_token(token):
+    return re.sub(r"^[^\w]+|[^\w]+$", "", token.lower())
+
+
+def build_highlights(text, explanation):
+    weights = {normalize_token(w): float(s) for w, s in explanation if normalize_token(w)}
+    parts = []
+    for raw in text.split():
+        clean = normalize_token(raw)
+        weight = weights.get(clean, 0.0)
+        if weight > 0.01:
+            opacity = min(0.65, 0.12 + abs(weight) * 3.5)
+            style = f"background:rgba(220,53,69,{opacity:.2f});border-bottom:2px solid #dc3545;"
+        elif weight < -0.01:
+            opacity = min(0.65, 0.12 + abs(weight) * 3.5)
+            style = f"background:rgba(25,135,84,{opacity:.2f});border-bottom:2px solid #198754;"
+        else:
+            style = ""
+        parts.append(f'<span style="display:inline-block;margin:2px 2px;padding:2px 4px;border-radius:4px;{style}">{html.escape(raw)}</span>')
+    return '<div class="highlight-box">' + " ".join(parts) + '</div><div class="legend"><span class="fake-key">■</span> pushes toward FAKE &nbsp;&nbsp;<span class="real-key">■</span> pushes toward REAL</div>'
+
+
+def build_bar_chart(explanation):
+    max_abs = max((abs(float(w)) for _, w in explanation), default=1.0)
+    rows = []
+    for word, weight in explanation:
+        weight = float(weight)
+        width = min(100, abs(weight) / max_abs * 100)
+        color = "#dc3545" if weight >= 0 else "#198754"
+        direction = "FAKE" if weight >= 0 else "REAL"
+        rows.append(f'<div class="bar-row"><div class="bar-label">{html.escape(str(word))}</div><div class="bar-track"><div class="bar-fill" style="width:{width:.1f}%;background:{color};"></div></div><div class="bar-value" style="color:{color};">{weight:+.3f} ({direction})</div></div>')
+    return '<div class="bars">' + ''.join(rows) + '</div>'
+
+
+def analyze(text):
+    if not text or not text.strip():
+        return "⚠️ Please enter a news claim or headline.", "", "", ""
+    text = text.strip()[:500]
     try:
-        headers  = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-        response = requests.post(API_URL, headers=headers, json={"inputs": text}, timeout=30)
-        result   = response.json()
-        prob_real, prob_fake = 0.5, 0.5
-        if isinstance(result, list):
-            scores = result[0] if isinstance(result[0], list) else result
-            for item in scores:
-                if isinstance(item, dict):
-                    lbl = item.get("label","").upper()
-                    sc  = item.get("score", 0.0)
-                    if lbl in ["LABEL_0","REAL","0"]:
-                        prob_real = sc
-                    elif lbl in ["LABEL_1","FAKE","1"]:
-                        prob_fake = sc
-        elif isinstance(result, dict) and "error" in result:
-            return jsonify({"label":"Loading","confidence":0,"prob_real":50,"prob_fake":50,
-                           "highlights":"Model loading, wait 20 seconds and retry.",
-                           "explanation": result["error"]})
-        pred  = 1 if prob_fake > prob_real else 0
-        label = "Fake" if pred == 1 else "Real"
-        conf  = round((prob_fake if pred==1 else prob_real)*100, 1)
-        fake_found, real_found, html_parts = [], [], []
-        for word in text.split():
-            clean = word.lower().strip(".,!?;:'\"")
-            if clean in FAKE_WORDS:
-                fake_found.append(clean)
-                html_parts.append(f'<span class="fw">{word}</span>')
-            elif clean in REAL_WORDS:
-                real_found.append(clean)
-                html_parts.append(f'<span class="rw">{word}</span>')
-            else:
-                html_parts.append(word)
-        highlights  = " ".join(html_parts)
-        explanation = ""
-        if fake_found: explanation += f"Fake indicators: {', '.join(set(fake_found))}\n"
-        if real_found: explanation += f"Real indicators: {', '.join(set(real_found))}\n"
-        if not fake_found and not real_found:
-            explanation = "No strong indicator words — prediction based on overall context."
-        return jsonify({"label":label,"confidence":conf,
-                       "prob_real":round(prob_real*100,1),
-                       "prob_fake":round(prob_fake*100,1),
-                       "highlights":highlights,"explanation":explanation})
-    except Exception as e:
-        return jsonify({"error": str(e)})
+        _, _, explainer = load_model()
+        probs = np.array(cached_prediction(text))
+        pred_label = int(np.argmax(probs))
+        confidence = float(probs[pred_label])
+        label = LABEL_NAMES[pred_label]
+        real_pct, fake_pct = float(probs[0])*100, float(probs[1])*100
+
+        exp = explainer.explain_instance(
+            text, predict_proba, num_features=LIME_FEATURES,
+            num_samples=LIME_SAMPLES, labels=[pred_label]
+        )
+        explanation = exp.as_list(label=pred_label)
+
+        if label == "Fake":
+            verdict = f'<div class="verdict fake"><div class="verdict-title">⚠️ LIKELY FAKE</div><div class="confidence">Model confidence: {confidence*100:.1f}%</div></div>'
+        else:
+            verdict = f'<div class="verdict real"><div class="verdict-title">✅ LIKELY REAL</div><div class="confidence">Model confidence: {confidence*100:.1f}%</div></div>'
+
+        gauge = f'<div class="gauge-wrap"><div class="gauge-title">Credibility Score — {real_pct:.1f}% Real</div><div class="gauge-track"><div class="gauge-real" style="width:{real_pct:.2f}%"></div></div><div class="gauge-labels"><span>0% Fake</span><span>50%</span><span>100% Real</span></div><div class="probabilities"><span>Real: <b>{real_pct:.1f}%</b></span><span>Fake: <b>{fake_pct:.1f}%</b></span></div></div>'
+        return verdict, gauge, build_highlights(text, explanation), build_bar_chart(explanation)
+    except Exception as exc:
+        return f'<div class="error">Analysis failed: {html.escape(str(exc))}</div>', "", "", ""
+
+
+SAMPLES = [
+    "The president signed a new infrastructure bill worth 1 trillion dollars.",
+    "Scientists confirm that drinking bleach cures all known diseases.",
+    "NASA announced plans to return astronauts to the moon.",
+    "The government secretly banned all elections and free speech permanently.",
+]
+
+CSS = """
+body{background:#f7f8fa}.gradio-container{max-width:950px!important}.title{text-align:center;font-size:2.5rem;font-weight:800}.subtitle{text-align:center;color:#667085;margin-bottom:25px}.verdict{padding:18px 22px;border-radius:12px;margin-top:10px}.verdict.fake{background:#fff1f2;border-left:6px solid #dc3545}.verdict.real{background:#ecfdf3;border-left:6px solid #198754}.verdict-title{font-size:1.6rem;font-weight:800}.confidence{margin-top:5px;color:#667085}.gauge-wrap{padding:14px 4px}.gauge-title{font-weight:700;margin-bottom:9px}.gauge-track{height:22px;background:#f8d7da;border-radius:999px;overflow:hidden}.gauge-real{height:100%;background:#198754;border-radius:999px}.gauge-labels,.probabilities{display:flex;justify-content:space-between;margin-top:7px;color:#667085}.probabilities{margin-top:14px;color:#344054}.highlight-box{line-height:2;padding:14px;border:1px solid #e4e7ec;border-radius:10px;background:#fff}.legend{margin-top:10px;color:#667085;font-size:.9rem}.fake-key{color:#dc3545}.real-key{color:#198754}.bars{background:#fff;padding:12px;border-radius:10px;border:1px solid #e4e7ec}.bar-row{display:grid;grid-template-columns:120px 1fr 120px;gap:10px;align-items:center;margin:8px 0}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-track{height:14px;background:#f2f4f7;border-radius:8px;overflow:hidden}.bar-fill{height:100%;border-radius:8px}.bar-value{text-align:right;font-size:.85rem}.error{padding:14px;background:#fff1f2;color:#b42318;border-radius:10px}@media(max-width:650px){.title{font-size:2rem}.bar-row{grid-template-columns:80px 1fr}.bar-value{grid-column:2;text-align:left}}
+"""
+
+with gr.Blocks(title="Fake News Detector", css=CSS) as demo:
+    gr.HTML('<div class="title">🕵️ Fake News Detector</div><div class="subtitle">Powered by DistilBERT + LIME Explainability · AI Final Group Project</div>')
+    gr.Markdown("### 📝 Enter a news claim or headline")
+    text = gr.Textbox(lines=5, max_lines=8, max_length=500, placeholder='e.g. "The government secretly banned all elections permanently."', label="News claim")
+    analyze_btn = gr.Button("🔍 Analyze Claim", variant="primary")
+    gr.Examples(examples=SAMPLES, inputs=text, label="💡 Try a sample claim")
+    gr.Markdown("### 🏷️ Verdict")
+    verdict = gr.HTML()
+    gr.Markdown("### 📊 Credibility Score")
+    gauge = gr.HTML()
+    gr.Markdown("### 🔍 Why did the model decide this?")
+    highlights = gr.HTML()
+    gr.Markdown("### 📈 Top Influencing Words")
+    bars = gr.HTML()
+    gr.Markdown("⚠️ This tool is a decision-support aid — not an arbiter of truth. Always verify important claims with trusted primary sources.")
+    analyze_btn.click(analyze, inputs=text, outputs=[verdict, gauge, highlights, bars], show_progress="full")
+    text.submit(analyze, inputs=text, outputs=[verdict, gauge, highlights, bars], show_progress="full")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    load_model()
+    demo.launch()
